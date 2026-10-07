@@ -1,12 +1,15 @@
 import asyncio
 
 import resp
-from store import Store
+from store import Store, WrongTypeError
 
 HOST = "127.0.0.1"
 PORT = 6380
 
 store = Store()
+
+NOT_INT = "ERR value is not an integer or out of range"
+WRONGTYPE = "WRONGTYPE Operation against a key holding the wrong kind of value"
 
 
 def parse_int(b: bytes):
@@ -20,7 +23,7 @@ def wrong_args(name: str) -> bytes:
     return resp.error(f"ERR wrong number of arguments for '{name}' command")
 
 
-# ---------- command handlers: each takes args (without the command name) ----------
+# ---------- connection / generic ----------
 
 def cmd_ping(args):
     if len(args) == 0:
@@ -34,37 +37,6 @@ def cmd_echo(args):
     if len(args) != 1:
         return wrong_args("echo")
     return resp.bulk_string(args[0])
-
-
-def cmd_set(args):
-    # SET key value [EX seconds | PX milliseconds]
-    if len(args) < 2:
-        return wrong_args("set")
-    key, value = args[0], args[1]
-    ttl = None
-    i = 2
-    while i < len(args):
-        opt = args[i].upper()
-        if opt in (b"EX", b"PX"):
-            if i + 1 >= len(args):
-                return resp.error("ERR syntax error")
-            n = parse_int(args[i + 1])
-            if n is None:
-                return resp.error("ERR value is not an integer or out of range")
-            if n <= 0:
-                return resp.error("ERR invalid expire time in 'set' command")
-            ttl = n if opt == b"EX" else n / 1000
-            i += 2
-        else:
-            return resp.error("ERR syntax error")
-    store.set(key, value, ttl)
-    return resp.simple_string("OK")
-
-
-def cmd_get(args):
-    if len(args) != 1:
-        return wrong_args("get")
-    return resp.bulk_string(store.get(args[0]))
 
 
 def cmd_del(args):
@@ -84,7 +56,7 @@ def cmd_expire(args):
         return wrong_args("expire")
     n = parse_int(args[1])
     if n is None:
-        return resp.error("ERR value is not an integer or out of range")
+        return resp.error(NOT_INT)
     return resp.integer(1 if store.expire(args[0], n) else 0)
 
 
@@ -94,15 +66,152 @@ def cmd_ttl(args):
     return resp.integer(store.ttl(args[0]))
 
 
+def cmd_type(args):
+    if len(args) != 1:
+        return wrong_args("type")
+    return resp.simple_string(store.type(args[0]))
+
+
+def cmd_keys(args):
+    if len(args) != 1:
+        return wrong_args("keys")
+    return resp.array([resp.bulk_string(k) for k in store.keys(args[0])])
+
+
+def cmd_dbsize(args):
+    if args:
+        return wrong_args("dbsize")
+    return resp.integer(store.dbsize())
+
+
+# ---------- strings ----------
+
+def cmd_set(args):
+    # SET key value [EX seconds | PX milliseconds]
+    if len(args) < 2:
+        return wrong_args("set")
+    key, value = args[0], args[1]
+    ttl = None
+    i = 2
+    while i < len(args):
+        opt = args[i].upper()
+        if opt in (b"EX", b"PX"):
+            if i + 1 >= len(args):
+                return resp.error("ERR syntax error")
+            n = parse_int(args[i + 1])
+            if n is None:
+                return resp.error(NOT_INT)
+            if n <= 0:
+                return resp.error("ERR invalid expire time in 'set' command")
+            ttl = n if opt == b"EX" else n / 1000
+            i += 2
+        else:
+            return resp.error("ERR syntax error")
+    store.set(key, value, ttl)
+    return resp.simple_string("OK")
+
+
+def cmd_get(args):
+    if len(args) != 1:
+        return wrong_args("get")
+    return resp.bulk_string(store.get(args[0]))
+
+
+def _incr(args, name, sign):
+    n = 1
+    if name.endswith("by"):
+        if len(args) != 2:
+            return wrong_args(name)
+        n = parse_int(args[1])
+        if n is None:
+            return resp.error(NOT_INT)
+    elif len(args) != 1:
+        return wrong_args(name)
+    try:
+        return resp.integer(store.incr_by(args[0], sign * n))
+    except ValueError:
+        return resp.error(NOT_INT)
+
+
+def cmd_incr(args):
+    return _incr(args, "incr", 1)
+
+
+def cmd_decr(args):
+    return _incr(args, "decr", -1)
+
+
+def cmd_incrby(args):
+    return _incr(args, "incrby", 1)
+
+
+def cmd_decrby(args):
+    return _incr(args, "decrby", -1)
+
+
+def cmd_append(args):
+    if len(args) != 2:
+        return wrong_args("append")
+    return resp.integer(store.append(args[0], args[1]))
+
+
+def cmd_strlen(args):
+    if len(args) != 1:
+        return wrong_args("strlen")
+    return resp.integer(store.strlen(args[0]))
+
+
+# ---------- lists ----------
+
+def cmd_lpush(args):
+    if len(args) < 2:
+        return wrong_args("lpush")
+    return resp.integer(store.push(args[0], args[1:], left=True))
+
+
+def cmd_rpush(args):
+    if len(args) < 2:
+        return wrong_args("rpush")
+    return resp.integer(store.push(args[0], args[1:], left=False))
+
+
+def cmd_lpop(args):
+    if len(args) != 1:
+        return wrong_args("lpop")
+    return resp.bulk_string(store.pop(args[0], left=True))
+
+
+def cmd_rpop(args):
+    if len(args) != 1:
+        return wrong_args("rpop")
+    return resp.bulk_string(store.pop(args[0], left=False))
+
+
+def cmd_llen(args):
+    if len(args) != 1:
+        return wrong_args("llen")
+    return resp.integer(store.llen(args[0]))
+
+
+def cmd_lrange(args):
+    if len(args) != 3:
+        return wrong_args("lrange")
+    start, stop = parse_int(args[1]), parse_int(args[2])
+    if start is None or stop is None:
+        return resp.error(NOT_INT)
+    items = store.lrange(args[0], start, stop)
+    return resp.array([resp.bulk_string(i) for i in items])
+
+
 COMMANDS = {
-    "PING": cmd_ping,
-    "ECHO": cmd_echo,
-    "SET": cmd_set,
-    "GET": cmd_get,
-    "DEL": cmd_del,
-    "EXISTS": cmd_exists,
-    "EXPIRE": cmd_expire,
-    "TTL": cmd_ttl,
+    "PING": cmd_ping, "ECHO": cmd_echo,
+    "DEL": cmd_del, "EXISTS": cmd_exists, "EXPIRE": cmd_expire, "TTL": cmd_ttl,
+    "TYPE": cmd_type, "KEYS": cmd_keys, "DBSIZE": cmd_dbsize,
+    "SET": cmd_set, "GET": cmd_get,
+    "INCR": cmd_incr, "DECR": cmd_decr, "INCRBY": cmd_incrby, "DECRBY": cmd_decrby,
+    "APPEND": cmd_append, "STRLEN": cmd_strlen,
+    "LPUSH": cmd_lpush, "RPUSH": cmd_rpush, "LPOP": cmd_lpop, "RPOP": cmd_rpop,
+    "LLEN": cmd_llen, "LRANGE": cmd_lrange,
 }
 
 
@@ -111,7 +220,10 @@ def execute(args: list) -> bytes:
     handler = COMMANDS.get(name)
     if handler is None:
         return resp.error(f"ERR unknown command '{name.lower()}'")
-    return handler(args[1:])
+    try:
+        return handler(args[1:])
+    except WrongTypeError:
+        return resp.error(WRONGTYPE)
 
 
 # ---------- networking ----------
@@ -142,7 +254,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
 
 async def expiry_loop():
-    """Background task: actively delete expired keys once per second."""
     while True:
         await asyncio.sleep(1)
         removed = store.purge_expired()
