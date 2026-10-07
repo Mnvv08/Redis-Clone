@@ -1,7 +1,28 @@
 import asyncio
 
+import resp
+
 HOST = "127.0.0.1"
 PORT = 6380
+
+
+def execute(args: list) -> bytes:
+    """Take a parsed command and return the RESP reply."""
+    cmd = args[0].upper().decode(errors="replace")
+
+    if cmd == "PING":
+        if len(args) == 1:
+            return resp.simple_string("PONG")
+        if len(args) == 2:
+            return resp.bulk_string(args[1])
+        return resp.error("ERR wrong number of arguments for 'ping' command")
+
+    if cmd == "ECHO":
+        if len(args) != 2:
+            return resp.error("ERR wrong number of arguments for 'echo' command")
+        return resp.bulk_string(args[1])
+
+    return resp.error(f"ERR unknown command '{cmd.lower()}'")
 
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -10,13 +31,18 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
     try:
         while True:
-            data = await reader.read(1024)   # wait for bytes from the client
-            if not data:                     # empty bytes = client disconnected
+            args = await resp.read_command(reader)
+            if args is None:      # disconnected
                 break
-            print(f"[<] {addr} sent: {data!r}")
-            writer.write(data)               # echo back for now
+            if not args:          # blank line, ignore
+                continue
+            print(f"[<] {addr}: {args}")
+            writer.write(execute(args))
             await writer.drain()
-    except ConnectionResetError:
+    except resp.ProtocolError as e:
+        writer.write(resp.error(f"ERR Protocol error: {e}"))
+        await writer.drain()
+    except (asyncio.IncompleteReadError, ConnectionResetError):
         pass
     finally:
         print(f"[-] Client disconnected: {addr}")
