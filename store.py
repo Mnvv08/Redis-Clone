@@ -160,3 +160,16 @@ class Store:
             return []
         stop = min(stop, n - 1)
         return list(lst)[start:stop + 1]
+
+    # ---------- snapshot (used by AOF rewrite) ----------
+
+    def dump(self):
+        """Return [(key, value, seconds_remaining_or_None)] for all live keys."""
+        self.purge_expired()
+        now = time.monotonic()
+        out = []
+        for key, value in list(self._data.items()):
+            deadline = self._expires.get(key)
+            remaining = None if deadline is None else max(0.0, deadline - now)
+            out.append((key, value, remaining))
+        return out
