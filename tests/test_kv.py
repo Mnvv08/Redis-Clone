@@ -270,14 +270,14 @@ def reference(log):
     return ref, results, copies
 
 
-def chaos(seed, power, clients=3, count=12, keys=("a", "b", "c")):
+def chaos(seed, power, clients=3, count=12, keys=("a", "b", "c"), **options):
     rng = random.Random(seed)
 
     def hook(node_id, event):
         if rng.random() < 0.003:
             raise PowerCut(c.nodes[node_id].storage.disk, event)
     c = KVCluster(rng.choice([3, 5]), seed=seed, disk_hook=hook if power else None, drop=0.1, duplicate=0.1,
-                  latency=(1, 40))
+                  latency=(1, 40), **options)
     c.start()
     loads = [Workload(c, c.client(f"c{i}", retry=rng.choice([80, 200, 400])), random.Random(seed * 10 + i), count, keys)
              for i in range(clients)]
@@ -311,13 +311,13 @@ def chaos(seed, power, clients=3, count=12, keys=("a", "b", "c")):
 
 def verify(c):
     c.check_logs()
-    ref, results, copies = reference(c.nodes[1].log)
+    ref, results, copies = reference([c.committed[i] for i in sorted(c.committed)])      # snapshots may have trimmed the log
     for store in c.stores.values():
         assert store.data == ref.data
         assert store.executed == len(results)                                         # every request ran exactly once
     assert len({repr(v) for v in c.store_states().values()}) == 1
     assert c.responses == results                                                     # first execution's answer, for every request
-    assert len(c.committed) == len(c.nodes[1].log)                                    # the Raft monitors saw every entry applied
+    assert len(c.committed) == c.nodes[1].last_log_index                              # the Raft monitors saw every entry applied
     for record in c.ops:
         assert record["done"]
         assert record["result"] == results[(record["client"], record["seq"])]         # the client saw the real answer

@@ -15,12 +15,22 @@ The dedup happens when the command is APPLIED, not when it is proposed, so it wo
 the retry went to and however many copies ended up in the log.
 
 Commands are JSON dicts: {"c": client, "s": seq, "op": "put|get|delete|cas|append", "k": key, ...}.
+Snapshots (Step 7) must contain the SESSION TABLE as well as the data. If they did not, a node restored from
+a snapshot would forget which requests it had already run, and a retry of an old request would execute a
+second time: exactly-once would silently break. KVStore.snapshot() / from_snapshot() carry both.
+
 Results are {"ok": value} or {"error": text}. Reads go through the log too, which is simple and
 linearizable (a read-index optimisation would avoid the log append, at the cost of more rules).
 """
-from raft import Cluster
+import copy
+
+from raft import Cluster, SafetyViolation
 
 OPS = ("put", "get", "delete", "cas", "append")
+
+
+class SnapshotViolation(SafetyViolation):
+    """A snapshot does not equal the state obtained by replaying the committed log up to its index."""
 
 
 class KVStore:
@@ -32,6 +42,19 @@ class KVStore:
         self.executed = 0             # commands really executed (duplicates do not count)
         self.replays = 0              # retries answered from the session table
         self.stale = 0                # requests older than the client's latest, ignored
+
+    def snapshot(self):
+        """Everything needed to continue from here, as plain JSON (client ids may be ints, so no dict keys)."""
+        return {"data": copy.deepcopy(self.data), "executed": self.executed,
+                "sessions": [[client, seq, copy.deepcopy(result)] for client, (seq, result) in self.sessions.items()]}
+
+    @classmethod
+    def from_snapshot(cls, state):
+        store = cls()
+        store.data = copy.deepcopy(state["data"])
+        store.executed = state["executed"]
+        store.sessions = {client: (seq, copy.deepcopy(result)) for client, seq, result in state["sessions"]}
+        return store
 
     def apply(self, command):
         if (not isinstance(command, dict) or not {"c", "s", "op"} <= command.keys()
@@ -168,6 +191,28 @@ class KVCluster(Cluster):
 
     def client(self, client_id, **options):
         return KVClient(self, client_id, **options)
+
+    # ----- snapshots: the node asks for the store's state, or is handed a state to continue from
+
+    def _take_snapshot(self, node):
+        return self.stores[node.id].snapshot()
+
+    def _restore(self, node, state):
+        self.stores[node.id] = KVStore.from_snapshot(state)
+
+    def _on_snapshot(self, node, index, term, state):
+        """Monitor: a snapshot at `index` must equal what replaying the committed entries 1..index produces."""
+        super()._on_snapshot(node, index, term, state)
+        if index > len(self.committed) or any(i not in self.committed for i in range(1, index + 1)):
+            return                                       # not every entry up to here was applied anywhere yet
+        reference = KVStore()
+        for i in range(1, index + 1):
+            if self.committed[i].command is not None:
+                reference.apply(self.committed[i].command)
+        got = KVStore.from_snapshot(state)
+        if (got.data, got.sessions, got.executed) != (reference.data, reference.sessions, reference.executed):
+            raise SnapshotViolation(f"node {node.id}: the snapshot at index {index} differs from the replayed log\n"
+                                    f"  snapshot: {got.data} {got.sessions}\n  replayed: {reference.data} {reference.sessions}")
 
     def _record_apply(self, node, index, entry):
         super()._record_apply(node, index, entry)       # the Raft safety monitors still run first
