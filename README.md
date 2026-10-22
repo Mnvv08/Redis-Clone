@@ -1,0 +1,146 @@
+# minidis
+
+A Redis-compatible in-memory database server written from scratch in Python (asyncio). It speaks the real **RESP protocol**, so the official `redis-cli` can talk to it. It supports strings, lists, key expiry, disk persistence with crash recovery, log compaction and pub/sub.
+
+Built as a learning project to understand how databases and network servers work internally. No third-party runtime dependencies, only the Python standard library.
+
+## Features
+
+- **RESP protocol** parser and encoder (binary-safe, supports inline commands)
+- **Data types:** strings and lists, with `WRONGTYPE` errors like real Redis
+- **Key expiry:** lazy (checked on access) plus active (background sweep every second)
+- **Persistence:** append-only file (AOF) with replay on startup
+- **Crash recovery:** a torn write at the end of the log is detected and truncated
+- **Log compaction:** atomic rewrite of the AOF into a minimal snapshot (`REWRITEAOF`, also automatic)
+- **Pub/sub:** `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH`, with slow-consumer protection
+- **55 automated tests** (pytest)
+
+## Quick start
+
+Requires Python 3.10+.
+
+```bash
+git clone https://github.com/Mnvv08/Redis-Clone.git
+cd Redis-Clone
+python3 -m venv venv
+source venv/bin/activate
+
+python server.py          # listens on 127.0.0.1:6380
+```
+
+In another terminal:
+
+```bash
+python cli.py SET name manav
+python cli.py GET name
+python cli.py INCR counter
+python cli.py RPUSH mylist a b c
+python cli.py LRANGE mylist 0 -1
+```
+
+With the real Redis client:
+
+```bash
+redis-cli -p 6380 PING
+```
+
+Pub/sub:
+
+```bash
+python subscriber.py news                 # terminal A: listens
+python cli.py PUBLISH news "hello"        # terminal B: publishes
+```
+
+Run the tests:
+
+```bash
+pip install -r requirements-dev.txt
+pytest -v
+```
+
+Set `MINIDIS_VERBOSE=1` to log every command the server receives.
+
+## Supported commands
+
+| Group | Commands |
+|---|---|
+| Connection | `PING`, `ECHO` |
+| Keys | `DEL`, `EXISTS`, `EXPIRE`, `PEXPIREAT`, `TTL`, `TYPE`, `KEYS`, `DBSIZE` |
+| Strings | `SET` (with `EX` / `PX`), `GET`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `APPEND`, `STRLEN` |
+| Lists | `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LLEN`, `LRANGE` |
+| Pub/sub | `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH` |
+| Server | `REWRITEAOF` |
+
+## Architecture
+
+```mermaid
+flowchart LR
+    C[Clients<br/>redis-cli / cli.py] -->|TCP, RESP| S[asyncio server<br/>server.py]
+    S --> P[RESP parser<br/>resp.py]
+    P --> D{Command<br/>dispatch}
+    D --> ST[(Store<br/>store.py<br/>strings, lists, TTLs)]
+    D --> PS[PubSub<br/>pubsub.py]
+    D -->|successful writes| A[AOF<br/>aof.py]
+    A --> F[(appendonly.aof)]
+    F -.->|replay on startup| ST
+    PS -->|push messages| SUB[Subscribers]
+```
+
+| File | Responsibility |
+|---|---|
+| `server.py` | TCP server, command table, AOF logging, background tasks |
+| `resp.py` | RESP request parsing and reply encoding |
+| `store.py` | In-memory data, expiry, type checks, snapshots |
+| `aof.py` | Append-only log: write, fsync policy, replay, atomic rewrite |
+| `pubsub.py` | Channel subscriptions and message fan-out |
+| `cli.py`, `subscriber.py` | Small test clients |
+| `bench.py` | Load generator |
+| `tests/` | pytest suite |
+
+## Design notes
+
+**Single-threaded event loop.** All clients are served by one asyncio loop, like real Redis. No command awaits while it touches the store, so each command is atomic without any locks (`INCR` cannot interleave with another client).
+
+**Two kinds of expiry.** Lazy expiry deletes a key when it is accessed after its deadline. Active expiry sweeps for expired keys every second, so keys nobody reads do not leak memory. Deadlines use `time.monotonic()` so clock changes cannot break them.
+
+**Deterministic persistence.** Relative TTLs (`SET k v EX 60`) are logged as absolute `PEXPIREAT` timestamps, and expirations are logged as `DEL`. Replaying the log after a restart therefore never resurrects a key that should be gone. Expiry is paused during replay and swept afterwards.
+
+**Crash safety.** The log is fsynced once per second (`everysec`, configurable). On startup, an incomplete command at the end of the file is detected and truncated, so a crash mid-write never blocks recovery.
+
+**Atomic compaction.** `REWRITEAOF` writes a minimal snapshot to a temporary file, fsyncs it, then swaps it in with `os.replace`. A crash at any point leaves either the old or the new log intact. Compaction also triggers automatically when the log passes 1 MB and has doubled since the last rewrite.
+
+**Pub/sub back-pressure.** Messages are written without waiting for each subscriber, so one slow client cannot block the others. A subscriber whose output buffer passes 1 MB is disconnected.
+
+## Benchmarks
+
+Measured with `bench.py` (50 concurrent clients, 100,000 requests, 64-byte values, AOF on with `everysec`) on a MacBook Air.
+
+| Server | SET ops/sec | GET ops/sec |
+|---|---|---|
+| minidis (no pipelining) | 14,000 | 21,000 |
+| minidis (pipeline 16) | 90,000 | 120,000 |
+
+Real Redis is written in optimized C and is expected to be several times faster. The goal here is understanding the design, not matching Redis's speed.
+
+## Known limitations
+
+- `KEYS` and the active expiry sweep are O(n). Real Redis uses incremental `SCAN` and randomized expiry sampling.
+- `REWRITEAOF` runs in the event loop and pauses the server while it runs. Real Redis forks a child process.
+- Single database, no authentication, no transactions (`MULTI`/`EXEC`), no replication.
+- `PUBLISH` messages are not persisted and are delivered at most once.
+
+## What I learned
+
+- How a binary-safe protocol frames messages on top of a TCP byte stream
+- Why a single-threaded event loop gives atomic commands without locks
+- Write-ahead logging, fsync trade-offs, torn-write recovery and log compaction
+- Making replay deterministic: absolute timestamps instead of relative ones
+- Back-pressure in broadcast systems
+- Testing a server by splitting it into pieces that can be checked with fakes
+
+## Possible next steps
+
+- `SCAN`, hashes and sets
+- Non-blocking AOF rewrite using `os.fork()`
+- `uvloop` and batched log writes to speed things up
+- Simple master/replica replication
