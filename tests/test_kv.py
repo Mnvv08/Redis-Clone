@@ -270,7 +270,7 @@ def reference(log):
     return ref, results, copies
 
 
-def chaos(seed, power):
+def chaos(seed, power, clients=3, count=12, keys=("a", "b", "c")):
     rng = random.Random(seed)
 
     def hook(node_id, event):
@@ -279,8 +279,8 @@ def chaos(seed, power):
     c = KVCluster(rng.choice([3, 5]), seed=seed, disk_hook=hook if power else None, drop=0.1, duplicate=0.1,
                   latency=(1, 40))
     c.start()
-    loads = [Workload(c, c.client(f"c{i}", retry=rng.choice([80, 200, 400])), random.Random(seed * 10 + i), 12)
-             for i in range(3)]
+    loads = [Workload(c, c.client(f"c{i}", retry=rng.choice([80, 200, 400])), random.Random(seed * 10 + i), count, keys)
+             for i in range(clients)]
     ids = list(c.nodes)
     for _ in range(120):
         action, node = rng.random(), c.nodes[rng.choice(ids)]
