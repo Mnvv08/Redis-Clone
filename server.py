@@ -1,4 +1,5 @@
 import asyncio
+import os
 import time
 from collections import deque
 
@@ -10,6 +11,7 @@ from store import Store, WrongTypeError
 HOST = "127.0.0.1"
 PORT = 6380
 AOF_PATH = "appendonly.aof"
+VERBOSE = os.environ.get("MINIDIS_VERBOSE") == "1"   # log every command
 
 store = Store()
 pubsub = PubSub()
@@ -370,7 +372,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 break
             if not args:
                 continue
-            print(f"[<] {addr}: {args}")
+            if VERBOSE:
+                print(f"[<] {addr}: {args}")
             name = args[0].upper().decode(errors="replace")
             reply = pubsub_dispatch(name, args[1:], writer)
             if reply is None:
