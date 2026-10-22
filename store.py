@@ -14,16 +14,22 @@ class Store:
     """In-memory store. A value is either bytes (string) or a deque (list)."""
 
     def __init__(self):
-        self._data = {}      # key -> bytes | deque
-        self._expires = {}   # key -> deadline (time.monotonic seconds)
+        self._data = {}        # key -> bytes | deque
+        self._expires = {}     # key -> deadline (time.monotonic seconds)
+        self.loading = False   # True while replaying the AOF (expiry paused)
+        self.on_expire = None  # callback(key) fired when a key expires
 
     # ---------- expiry helpers ----------
 
     def _purge_if_expired(self, key) -> bool:
+        if self.loading:
+            return False
         deadline = self._expires.get(key)
         if deadline is not None and time.monotonic() >= deadline:
             self._data.pop(key, None)
             self._expires.pop(key, None)
+            if self.on_expire:
+                self.on_expire(key)
             return True
         return False
 
@@ -33,6 +39,8 @@ class Store:
         for k in dead:
             self._data.pop(k, None)
             self._expires.pop(k, None)
+            if self.on_expire:
+                self.on_expire(k)
         return len(dead)
 
     # ---------- generic key commands ----------
@@ -63,7 +71,16 @@ class Store:
         self._expires[key] = time.monotonic() + seconds
         return True
 
+    def pexpireat(self, key, unix_ms) -> bool:
+        """Expire at an absolute unix time in milliseconds (used by AOF replay)."""
+        if not self.exists(key):
+            return False
+        remaining = unix_ms / 1000 - time.time()
+        self._expires[key] = time.monotonic() + remaining
+        return True
+
     def ttl(self, key) -> int:
+        """-2 = key missing, -1 = no expiry, otherwise seconds remaining."""
         if not self.exists(key):
             return -2
         deadline = self._expires.get(key)
