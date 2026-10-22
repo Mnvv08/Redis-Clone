@@ -2,3 +2,4 @@ venv/
 __pycache__/
 appendonly.aof.tmp
 .pytest_cache/
+appendonly.aof
