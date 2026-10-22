@@ -1,6 +1,6 @@
 """Raft consensus, built step by step on top of the deterministic simulator in sim.py.
 
-Step 2: LEADER ELECTION.  Step 3: LOG REPLICATION.  (Persistence arrives in step 4.)
+Step 2: LEADER ELECTION.  Step 3: LOG REPLICATION.  Step 4: PERSISTENCE AND CRASH RECOVERY.
 
 Every node is always a follower, a candidate or a leader. Time is divided into numbered terms. A
 follower that hears nothing from a leader for a randomly chosen timeout becomes a candidate, bumps
@@ -30,13 +30,19 @@ all checked by the tests while the simulator misbehaves:
 A new leader appends one empty "no-op" entry to its log so that entries from earlier terms can be
 committed straight away (Raft thesis, section 6.4).
 
-Persistent state (current_term, voted_for, log) is simply kept across crash/restart here; step 4
-replaces that shortcut with explicit storage. The commit index and the applied state machine are
-volatile: a restarted node learns the commit index again from its leader and re-applies its log.
+Persistence (storage.py): current_term, voted_for and the log live in a journal on a simulated
+disk and are synced BEFORE the node sends anything that depends on them: a vote, an
+acknowledgement of new entries, or a leader counting its own new entry toward a majority. After a
+crash everything in memory is thrown away and rebuilt from the journal. The commit index and the
+applied state machine are volatile: a restarted node learns the commit index again from its leader
+and re-applies its log. Commands must be JSON values because the journal is JSON.
 """
+import json
+import random
 from dataclasses import dataclass
 
 from sim import Network, Node, SimulationError, Simulator
+from storage import PowerCut, RaftStorage, SimDisk
 
 FOLLOWER, CANDIDATE, LEADER = "follower", "candidate", "leader"
 
@@ -101,16 +107,19 @@ class AppendReply:
 
 class RaftNode(Node):
     def __init__(self, node_id, sim, net, all_ids, election_timeout=(150.0, 300.0), heartbeat=50.0,
-                 on_leader=None, on_apply=None, max_entries=50):
+                 on_leader=None, on_apply=None, max_entries=50, storage=None):
         super().__init__(node_id, sim, net)
+        self.storage = storage or RaftStorage(SimDisk())
+        self.storage.disk.owner = self
         self.peers = [p for p in all_ids if p != node_id]
         self.quorum = len(all_ids) // 2 + 1
         self.election_timeout, self.heartbeat = election_timeout, heartbeat
         self.on_leader, self.on_apply, self.max_entries = on_leader, on_apply, max_entries
-        # persistent state (survives a crash)
+        # persistent state (reloaded from the journal after a crash)
         self.current_term = 0
         self.voted_for = None
         self.log = []                        # entries; the first one has index 1
+        self._recover()
         # volatile state (rebuilt after a restart)
         self.state = FOLLOWER
         self.leader_id = None
@@ -136,18 +145,25 @@ class RaftNode(Node):
     def start(self):
         self._reset_election_timer()
 
+    def _recover(self):
+        term, voted_for, entries = self.storage.load()
+        self.current_term, self.voted_for = term, voted_for
+        self.log = [Entry(t, c) for t, c in entries]
+
     def _reset_election_timer(self):
         self.set_timer("election", self.sim.rng.uniform(*self.election_timeout), self._on_election_timeout)
 
     def _cast_vote(self, candidate):
         self.voted_for = candidate
         self.vote_log.append((self.current_term, candidate))
+        self.storage.save_hard_state(self.current_term, self.voted_for)     # durable before any reply is sent
 
     def _step_down(self, term):
         """Adopt a (not older) term and become a follower."""
         if term > self.current_term:
             self.current_term = term
             self.voted_for = None
+            self.storage.save_hard_state(self.current_term, None)
         self.state = FOLLOWER
         self.votes = set()
         self.cancel_timer("heartbeat")
@@ -156,7 +172,11 @@ class RaftNode(Node):
 
     # ----- crash and restart
 
+    def on_crash(self):
+        self.storage.disk.crash()                        # whatever was not synced is gone (or torn)
+
     def on_restart(self):
+        self._recover()                                  # memory was lost; the journal is all we have
         self.state = FOLLOWER
         self.leader_id = None
         self.votes = set()
@@ -189,6 +209,7 @@ class RaftNode(Node):
         if self.on_leader is not None:
             self.on_leader(self)
         self.log.append(Entry(self.current_term, None))     # the no-op that lets old entries commit
+        self.storage.save_log(len(self.log), self.log[-1:])
         self._advance_commit()
         self._heartbeat()
 
@@ -205,8 +226,10 @@ class RaftNode(Node):
         """Append a command to the log. Only a leader can; returns its log index, or None."""
         if not self.up or self.state != LEADER:
             return None
+        json.dumps(command)                                   # refuse what the journal could not store
         self.log.append(Entry(self.current_term, command))
         index = len(self.log)
+        self.storage.save_log(index, self.log[-1:])          # durable before it counts toward a majority
         self._advance_commit()
         for peer in self.peers:
             self._replicate(peer)
@@ -300,14 +323,19 @@ class RaftNode(Node):
             self.send(src, AppendReply(self.current_term, False, 0, first))
             return
         index = prev
+        changed_from = None
         for entry in msg.entries:
             index += 1
             if index <= len(self.log):
                 if self.log[index - 1].term != entry.term:  # a conflict: drop it and everything after it
                     del self.log[index - 1:]
                     self.log.append(entry)
+                    changed_from = changed_from or index
             else:
                 self.log.append(entry)
+                changed_from = changed_from or index
+        if changed_from:                                  # make the change durable before acknowledging it
+            self.storage.save_log(changed_from, self.log[changed_from - 1:])
         last_new = prev + len(msg.entries)
         if msg.leader_commit > self.commit_index:         # never past what this message proved we match
             self.commit_index = max(self.commit_index, min(msg.leader_commit, last_new))
@@ -319,13 +347,17 @@ class Cluster:
     """A simulated cluster plus the checks that every test wants."""
 
     def __init__(self, n=3, seed=0, latency=(1.0, 10.0), drop=0.0, duplicate=0.0,
-                 election_timeout=(150.0, 300.0), heartbeat=50.0, max_entries=50, trace=False):
+                 election_timeout=(150.0, 300.0), heartbeat=50.0, max_entries=50, trace=False,
+                 disk_hook=None, sync=True, tear=True):
         self.sim = Simulator(seed)
         self.net = Network(self.sim, latency=latency, drop=drop, duplicate=duplicate, trace=trace)
         ids = list(range(1, n + 1))
+        hook = (lambda disk, event: disk_hook(disk.owner.id, event)) if disk_hook else None
         self.nodes = {i: RaftNode(i, self.sim, self.net, ids, election_timeout, heartbeat, self._record_leader,
-                                  self._record_apply, max_entries)
+                                  self._record_apply, max_entries,
+                                  RaftStorage(SimDisk(random.Random(seed * 1000 + i), None, hook, sync, tear)))
                       for i in ids}
+        self.power_cuts = []                             # (time, node id, disk event) for every injected cut
         self.leader_of_term = {}                         # term -> the only node allowed to lead it
         self.history = []                                # (time, term, leader) for every election won
         self.committed = {}                              # index -> the entry some node has applied there
@@ -356,11 +388,21 @@ class Cluster:
                     raise LogMatchingViolation(f"nodes {nodes[a].id} and {nodes[b].id} disagree below index {same[-1] + 1}")
 
     def propose(self, command):
-        """Hand a command to the current leader. Returns (leader, index), or None if there is no leader."""
+        """Hand a command to the current leader. Returns (leader, index), or None if there is no leader
+        (or the leader lost power while storing it)."""
         leader = self.stable_leader()
         if leader is None:
             return None
-        return leader, leader.propose(command)
+        try:
+            return leader, leader.propose(command)
+        except PowerCut as cut:
+            self._power_cut(cut)
+            return None
+
+    def _power_cut(self, cut):
+        node = cut.disk.owner
+        self.power_cuts.append((self.sim.now, node.id, cut.event))
+        node.crash()
 
     def converged(self):
         """Every running node holds the same log and has committed all of it."""
@@ -373,7 +415,13 @@ class Cluster:
         return self
 
     def run_for(self, duration):
-        self.sim.run(until=self.sim.now + duration)
+        end = self.sim.now + duration
+        while True:
+            try:
+                self.sim.run(until=end)
+                return
+            except PowerCut as cut:                      # the node whose disk was hit loses power; time goes on
+                self._power_cut(cut)
 
     def wait_for(self, predicate, timeout):
         """Advance time until predicate() is true; False if `timeout` elapses first."""
@@ -381,8 +429,11 @@ class Cluster:
         while self.sim.now <= deadline:
             if predicate():
                 return True
-            if not self.sim.step():
-                break
+            try:
+                if not self.sim.step():
+                    break
+            except PowerCut as cut:
+                self._power_cut(cut)
         return predicate()
 
     def leaders(self):
