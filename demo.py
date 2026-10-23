@@ -1,4 +1,4 @@
-"""The whole tour in one command: python demo.py   (about a second)"""
+"""The whole tour in one command: python demo.py   (about 5 seconds)"""
 import runpy
 
 TOUR = [
@@ -6,6 +6,7 @@ TOUR = [
     ("A key-value store where retries never run twice", "kv_demo.py"),
     ("Checking the history is linearizable, and catching a buggy server", "lin_demo.py"),
     ("Snapshots: the log stays small and a sleeping node catches up", "snapshot_demo.py"),
+    ("The real thing: 3 processes, TCP and files; kill the leader", "real_demo.py"),
 ]
 
 for number, (title, script) in enumerate(TOUR, 1):
